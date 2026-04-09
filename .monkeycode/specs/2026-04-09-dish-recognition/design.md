@@ -120,20 +120,30 @@ MainScreen (BottomNavigation)
 data class DishEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val name: String,
-    val imageUrls: List<String>,  // 多角度图片路径
+    val featureVector: FloatArray,  // 1280维特征向量
+    val imagePaths: List<String>,   // 多角度图片路径
     val createdAt: Long,
     val updatedAt: Long
-)
+) {
+    override equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (javaClass != other?.javaClass) return false
+        other as DishEntity
+        return id == other.id
+    }
+
+    override fun hashCode(): Int = id.hashCode()
+}
 
 @Entity(tableName = "nutrition")
 data class NutritionEntity(
     @PrimaryKey val dishId: Long,
-    val calories: Float,      // 热量 (kcal)
-    val fat: Float,            // 脂肪 (g)
-    val protein: Float,       // 蛋白质 (g)
-    val carbohydrate: Float,  // 碳水化合物 (g)
-    val vitamin: Float,       // 维生素 (mg)
-    val sodium: Float         // 钠 (mg)
+    val calories: Float,           // 热量 (kcal/100g)
+    val fat: Float,                 // 脂肪 (g/100g)
+    val protein: Float,            // 蛋白质 (g/100g)
+    val carbohydrate: Float,       // 碳水化合物 (g/100g)
+    val vitamin: Float,            // 维生素 (mg/100g)
+    val sodium: Float              // 钠 (mg/100g)
 )
 
 @Entity(tableName = "tableware_mapping")
@@ -177,31 +187,37 @@ data class TablewareMappingEntity(
 | 模型 | YOLOv5s (converted to TFLite) |
 | 输入 | 640x640 RGB Image |
 | 输出 | BoundingBox + Class + Confidence |
-| 类别 | dish, small_bowl, medium_bowl, large_bowl, small_plate, medium_plate, large_plate, long_plate |
+| 类别 | small_bowl, medium_bowl, large_bowl, small_plate, medium_plate, large_plate, long_plate |
 | 推理时间 | < 50ms (Snapdragon 865) |
 
-### 5.2 菜品分类模型
+### 5.2 特征向量提取模型
 
 | 项目 | 方案 |
 |------|------|
-| 模型 | MobileNetV3-Large (fine-tuned) |
+| 基础模型 | MobileNetV3-Large (预训练 ImageNet) |
 | 输入 | 224x224 RGB Image |
-| 输出 | Top-K 菜品分类概率 |
-| 训练方式 | Transfer Learning from ImageNet |
-| 自定义类别 | 用户添加的菜品 |
+| 输出 | 1280维特征向量 (1280-dim Float32) |
+| 提取层 | GlobalAveragePooling 后的特征层 |
+| 用途 | 用户自定义菜品的特征存储与相似度匹配 |
 
-### 5.3 模型文件结构
+### 5.3 向量检索机制
+
+| 项目 | 方案 |
+|------|------|
+| 相似度度量 | 余弦相似度 (Cosine Similarity) |
+| 匹配阈值 | 0.75 (可调整) |
+| 检索方式 | 暴力遍历 + 预过滤 |
+| 向量存储 | Room BLOB 字段存储 FloatArray |
+
+### 5.4 模型文件结构
 
 ```
 assets/
 ├── models/
-│   ├── yolov5s.tflite              # 目标检测模型
-│   └── mobilenetv3_dish.tflite     # 菜品分类模型
+│   ├── yolov5s.tflite                # 目标检测模型 (~30MB)
+│   └── mobilenetv3_feature.tflite   # 特征提取模型 (~20MB)
 ├── labels/
-│   ├── detection_labels.txt        # 检测标签
-│   └── classification_labels.txt   # 分类标签
-└── nutrition/
-    └── nutrition_data.db          # 营养数据库
+│   └── detection_labels.txt          # 检测标签
 ```
 
 ---
@@ -214,21 +230,25 @@ assets/
 sequenceDiagram
     participant Camera
     participant Detector
-    participant Classifier
+    participant FeatureExtractor
+    participant VectorDB
     participant Estimator
     participant UI
 
     Camera->>Detector: CameraX Frame
     Detector->>Detector: YOLOv5s Inference
-    Detector-->>UI: DetectionResult [餐具位置, 菜品位置]
-    
-    UI->>Classifier: 裁剪菜品区域图片
-    Classifier->>Classifier: MobileNetV3 Inference
-    Classifier-->>UI: 菜品分类结果
-    
+    Detector-->>UI: DetectionResult [餐具位置, 菜品区域]
+
+    UI->>FeatureExtractor: 裁剪菜品区域图片
+    FeatureExtractor->>FeatureExtractor: MobileNetV3 特征提取
+    FeatureExtractor-->>UI: 1280维特征向量
+
+    UI->>VectorDB: 查询相似菜品
+    VectorDB-->>UI: 匹配结果 (dishId, similarity)
+
     UI->>Estimator: 餐具类型
     Estimator-->>UI: 估算重量
-    
+
     UI->>UI: 叠加显示 + 营养计算
 ```
 
@@ -236,19 +256,35 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A[多角度拍摄 3-5张] --> B[图像预处理]
-    B --> C[特征提取]
-    C --> D[存储到本地]
+    A[多角度拍摄 3-5张] --> B[选择最佳图片]
+    B --> C[图像预处理 224x224]
+    C --> D[特征提取 1280维向量]
     D --> E[输入菜品名称]
-    E --> F[输入营养成分]
-    F --> G[保存到数据库]
-    G --> H[模型增量训练准备]
+    E --> F[输入营养成分 / 每100g]
+    F --> G[保存到数据库<br/>向量 + 营养 + 图片路径]
 ```
 
-### 6.3 营养计算流程
+### 6.3 向量匹配算法
+
+```kotlin
+fun cosineSimilarity(vecA: FloatArray, vecB: FloatArray): Float {
+    val dotProduct = vecA.zip(vecB).sumOf { (a, b) -> (a * b).toDouble() }
+    val normA = sqrt(vecA.map { it * it }.sumOf { it.toDouble() })
+    val normB = sqrt(vecB.map { it * it }.sumOf { it.toDouble() })
+    return (dotProduct / (normA * normB)).toFloat()
+}
+
+// 匹配逻辑
+val results = dishVectors.map { dish ->
+    dish to cosineSimilarity(inputVector, dish.featureVector)
+}.filter { (_, similarity) -> similarity >= MATCHING_THRESHOLD }
+    .sortedByDescending { (_, similarity) -> similarity }
+```
+
+### 6.4 营养计算流程
 
 ```
-营养估算 = 菜品单位营养 × 估算重量
+营养估算 = 菜品单位营养(每100g) × 估算重量
 
 示例：
 - 宫保鸡丁 (每100g): 热量 118kcal, 脂肪 7g, 蛋白质 11g
@@ -363,7 +399,8 @@ app/src/main/
 │   │   │       └── TablewareMappingEntity.kt
 │   │   └── ml/
 │   │       ├── ObjectDetectionModel.kt
-│   │       └── DishClassificationModel.kt
+│   │       ├── FeatureExtractorModel.kt
+│   │       └── VectorSearchEngine.kt
 │   │
 │   ├── ui/                             # UI层
 │   │   ├── theme/
@@ -400,12 +437,60 @@ app/src/main/
 |------|------|--------|
 | 1 | 项目初始化、架构搭建、相机预览 | P0 |
 | 2 | 目标检测模型集成、餐具识别 | P0 |
-| 3 | 数据库设计、Room集成 | P0 |
-| 4 | 菜品分类模型、多角度拍照 | P1 |
-| 5 | 营养成分计算与展示 | P1 |
-| 6 | UI优化、模型调优 | P2 |
-| 7 | 自定义菜品添加功能 | P2 |
+| 3 | 特征提取模型集成 | P0 |
+| 4 | 数据库设计、Room集成、向量存储 | P0 |
+| 5 | 向量搜索匹配引擎 | P0 |
+| 6 | 多角度拍照 + 表单添加菜品 | P1 |
+| 7 | 营养成分计算与展示 | P1 |
+| 8 | UI优化、模型调优 | P2 |
 
 ---
 
-如需调整或补充，请告知。
+## 12. 添加新菜品 UI 流程
+
+### 12.1 添加菜品表单
+
+```
+┌─────────────────────────────────────────┐
+│  添加新菜品                    [完成]    │
+├─────────────────────────────────────────┤
+│                                         │
+│  ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐       │
+│  │  +  │ │ img │ │ img │ │ img │ ...   │
+│  └─────┘ └─────┘ └─────┘ └─────┘       │
+│   添加照片                                │
+│                                         │
+│  菜品名称: [________________]           │
+│                                         │
+│  ─── 营养成分 (每100g) ───               │
+│  热量(kcal): [____]                     │
+│  脂肪(g): [____]                        │
+│  蛋白质(g): [____]                      │
+│  碳水化合物(g): [____]                   │
+│  维生素(mg): [____]                      │
+│  钠(mg): [____]                          │
+│                                         │
+└─────────────────────────────────────────┘
+```
+
+### 12.2 多角度拍照指引
+
+```
+┌─────────────────────────────────────────┐
+│           拍摄菜品照片                    │
+│                                         │
+│     ┌───────────────────────┐          │
+│     │                       │          │
+│     │      [  菜品  ]       │          │
+│     │                       │          │
+│     └───────────────────────┘          │
+│                                         │
+│   建议拍摄 3-5 张不同角度               │
+│   • 正面全景                             │
+│   • 侧面 45°                            │
+│   • 顶部俯视                             │
+│                                         │
+│   [  拍照  ]      [ 完成 ]              │
+│                                         │
+└─────────────────────────────────────────┘
+```

@@ -184,20 +184,23 @@ data class TablewareMappingEntity(
 
 | 项目 | 方案 |
 |------|------|
-| 模型 | YOLOv5s (converted to TFLite) |
+| 模型 | YOLOv8n (converted to TFLite) |
 | 输入 | 640x640 RGB Image |
 | 输出 | BoundingBox + Class + Confidence |
-| 类别 | small_bowl, medium_bowl, large_bowl, small_plate, medium_plate, large_plate, long_plate |
-| 推理时间 | < 50ms (Snapdragon 865) |
+| 类别 | dish, small_bowl, medium_bowl, large_bowl, small_plate, medium_plate, large_plate, long_plate |
+| 参数量 | 3.2M |
+| 模型大小 | ~12MB (TFLite) |
+| 推理时间 | < 25ms (Snapdragon 865) |
 
 ### 5.2 特征向量提取模型
 
 | 项目 | 方案 |
 |------|------|
-| 基础模型 | MobileNetV3-Large (预训练 ImageNet) |
+| 模型 | EfficientNet-B0 (预训练 ImageNet) |
 | 输入 | 224x224 RGB Image |
 | 输出 | 1280维特征向量 (1280-dim Float32) |
 | 提取层 | GlobalAveragePooling 后的特征层 |
+| 参数量 | 5.3M |
 | 用途 | 用户自定义菜品的特征存储与相似度匹配 |
 
 ### 5.3 向量检索机制
@@ -214,8 +217,8 @@ data class TablewareMappingEntity(
 ```
 assets/
 ├── models/
-│   ├── yolov5s.tflite                # 目标检测模型 (~30MB)
-│   └── mobilenetv3_feature.tflite   # 特征提取模型 (~20MB)
+│   ├── yolov8n.tflite               # 目标检测模型 (~12MB)
+│   └── efficientnetb0_feature.tflite # 特征提取模型 (~20MB)
 ├── labels/
 │   └── detection_labels.txt          # 检测标签
 ```
@@ -236,11 +239,11 @@ sequenceDiagram
     participant UI
 
     Camera->>Detector: CameraX Frame
-    Detector->>Detector: YOLOv5s Inference
+    Detector->>Detector: YOLOv8n Inference
     Detector-->>UI: DetectionResult [餐具位置, 菜品区域]
 
     UI->>FeatureExtractor: 裁剪菜品区域图片
-    FeatureExtractor->>FeatureExtractor: MobileNetV3 特征提取
+    FeatureExtractor->>FeatureExtractor: EfficientNet-B0 特征提取
     FeatureExtractor-->>UI: 1280维特征向量
 
     UI->>VectorDB: 查询相似菜品

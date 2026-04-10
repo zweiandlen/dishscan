@@ -13,24 +13,26 @@ import java.nio.MappedByteBuffer
 import java.nio.channels.FileChannel
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.math.max
+import kotlin.math.min
 
 @Singleton
 class ObjectDetectionModel @Inject constructor(
     @ApplicationContext private val context: Context
 ) {
     private var interpreter: Interpreter? = null
+    
+    companion object {
+        private const val MODEL_FILE = "yolov8n.tflite"
+        private const val INPUT_SIZE = 640
+        private const val NUM_CLASSES = 8
+    }
+    
     private val labels = listOf(
         "dish",
         "small_bowl", "medium_bowl", "large_bowl",
         "small_plate", "medium_plate", "large_plate", "long_plate"
     )
-    
-    companion object {
-        private const val MODEL_FILE = "yolov5s.tflite"
-        private const val INPUT_SIZE = 640
-        private const val NUM_DETECTIONS = 2535
-        private const val NUM_CLASSES = 8
-    }
 
     init {
         try {
@@ -48,18 +50,26 @@ class ObjectDetectionModel @Inject constructor(
         val fileDescriptor = context.assets.openFd(MODEL_FILE)
         val inputStream = fileDescriptor.createInputStream()
         val fileChannel = inputStream.channel
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, fileDescriptor.startOffset, fileDescriptor.length)
+        return fileChannel.map(
+            FileChannel.MapMode.READ_ONLY,
+            fileDescriptor.startOffset,
+            fileDescriptor.length
+        )
     }
 
     fun detect(bitmap: Bitmap): List<DetectionResult> {
         val interpreter = this.interpreter ?: return emptyList()
         
         val inputBuffer = preprocessBitmap(bitmap)
-        val outputArray = Array(1) { Array(NUM_DETECTIONS) { FloatArray(5 + NUM_CLASSES) } }
         
-        interpreter.run(inputBuffer, outputArray)
+        // YOLOv8 TFLite 输出格式: [1, 84, 8400] 
+        // 84 = 4 (x, y, w, h) + 80 (classes, 或自定义 num_classes)
+        // 8400 = 80*80 + 40*40 + 20*20 (多尺度特征图)
+        val outputBuffer = Array(1) { Array(INPUT_SIZE / 8 * INPUT_SIZE / 8 + INPUT_SIZE / 16 * INPUT_SIZE / 16 + INPUT_SIZE / 32 * INPUT_SIZE / 32) { FloatArray(4 + NUM_CLASSES) } }
         
-        return parseOutput(outputArray[0], bitmap.width, bitmap.height)
+        interpreter.run(inputBuffer, outputBuffer)
+        
+        return parseYOLOv8Output(outputBuffer[0], bitmap.width, bitmap.height)
     }
 
     private fun preprocessBitmap(bitmap: Bitmap): ByteBuffer {
@@ -71,6 +81,7 @@ class ObjectDetectionModel @Inject constructor(
         scaledBitmap.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
         
         for (pixel in pixels) {
+            // YOLOv8 使用 RGB 格式，范围 [0, 1]
             val r = ((pixel shr 16) and 0xFF) / 255f
             val g = ((pixel shr 8) and 0xFF) / 255f
             val b = (pixel and 0xFF) / 255f
@@ -82,47 +93,59 @@ class ObjectDetectionModel @Inject constructor(
         return inputBuffer
     }
 
-    private fun parseOutput(output: Array<FloatArray>, imgWidth: Int, imgHeight: Int): List<DetectionResult> {
+    private fun parseYOLOv8Output(
+        output: Array<FloatArray>,
+        imgWidth: Int,
+        imgHeight: Int
+    ): List<DetectionResult> {
         val results = mutableListOf<DetectionResult>()
         val confidenceThreshold = 0.5f
         
+        // YOLOv8 输出格式: [num_predictions, 4 + num_classes]
+        // 每行: [x, y, w, h, class0_score, class1_score, ...]
         for (detection in output) {
-            val objConfidence = detection[4]
-            if (objConfidence < confidenceThreshold) continue
-            
-            val classProbs = detection.copyOfRange(5, 5 + NUM_CLASSES)
-            var maxClassProb = Float.MIN_VALUE
-            var classId = 0
-            for (i in classProbs.indices) {
-                if (classProbs[i] > maxClassProb) {
-                    maxClassProb = classProbs[i]
-                    classId = i
+            // 找到最大类别分数
+            var maxClassScore = 0f
+            var maxClassId = 0
+            for (i in 0 until NUM_CLASSES) {
+                if (detection[4 + i] > maxClassScore) {
+                    maxClassScore = detection[4 + i]
+                    maxClassId = i
                 }
             }
             
-            val confidence = objConfidence * maxClassProb
+            // 物体置信度已经包含在 x, y, w, h 之后
+            // 这里假设 detection[4] 是物体置信度，detection[5:] 是类别分数
+            // 实际上 YOLOv8 的输出可能是 [x, y, w, h, obj_conf, ...class_scores]
+            val objConfidence = detection[4]
+            val classConfidence = maxClassScore
+            val confidence = objConfidence * classConfidence
+            
             if (confidence < confidenceThreshold) continue
-            if (classId < 0 || classId >= labels.size) continue
             
             val cx = detection[0]
             val cy = detection[1]
             val w = detection[2]
             val h = detection[3]
             
+            // 转换为像素坐标
             val left = ((cx - w / 2) / INPUT_SIZE * imgWidth).coerceIn(0f, imgWidth.toFloat())
             val top = ((cy - h / 2) / INPUT_SIZE * imgHeight).coerceIn(0f, imgHeight.toFloat())
             val right = ((cx + w / 2) / INPUT_SIZE * imgWidth).coerceIn(0f, imgWidth.toFloat())
             val bottom = ((cy + h / 2) / INPUT_SIZE * imgHeight).coerceIn(0f, imgHeight.toFloat())
             
+            if (right <= left || bottom <= top) continue
+            
             results.add(
                 DetectionResult(
                     boundingBox = BoundingBox(left, top, right, bottom),
-                    label = labels[classId],
+                    label = labels[maxClassId],
                     confidence = confidence
                 )
             )
         }
         
+        // 按置信度排序
         return results.sortedByDescending { it.confidence }
     }
 

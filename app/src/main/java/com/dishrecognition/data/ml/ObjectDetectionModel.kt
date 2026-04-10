@@ -1,11 +1,12 @@
 package com.dishrecognition.data.ml
 
 import android.content.Context
+import android.graphics.Bitmap
 import com.dishrecognition.domain.model.BoundingBox
 import com.dishrecognition.domain.model.DetectionResult
 import dagger.hilt.android.qualifiers.ApplicationContext
 import org.tensorflow.lite.Interpreter
-import java.io.FileInputStream
+import java.io.FileDescriptor
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.MappedByteBuffer
@@ -17,34 +18,59 @@ import javax.inject.Singleton
 class ObjectDetectionModel @Inject constructor(
     @ApplicationContext private val context: Context
 ) {
-    private val interpreter: Interpreter? = null
+    private var interpreter: Interpreter? = null
     private val labels = listOf(
+        "dish",
         "small_bowl", "medium_bowl", "large_bowl",
         "small_plate", "medium_plate", "large_plate", "long_plate"
     )
-
-    fun detect(frame: ByteBuffer, width: Int, height: Int): List<DetectionResult> {
-        val inputBuffer = preprocessFrame(frame, width, height)
-        val outputBuffer = Array(1) { Array(2535) { FloatArray(7) } }
-        
-        interpreter?.run(inputBuffer, outputBuffer)
-        
-        return parseOutput(outputBuffer[0])
+    
+    companion object {
+        private const val MODEL_FILE = "yolov5s.tflite"
+        private const val INPUT_SIZE = 640
+        private const val NUM_DETECTIONS = 2535
+        private const val NUM_CLASSES = 8
     }
 
-    private fun preprocessFrame(frame: ByteBuffer, width: Int, height: Int): ByteBuffer {
-        val inputSize = 640
-        val inputBuffer = ByteBuffer.allocateDirect(1 * inputSize * inputSize * 3 * 4)
+    init {
+        try {
+            val modelBuffer = loadModelFile()
+            val options = Interpreter.Options().apply {
+                numThreads = 4
+            }
+            interpreter = Interpreter(modelBuffer, options)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun loadModelFile(): MappedByteBuffer {
+        val fileDescriptor = context.assets.openFd(MODEL_FILE)
+        val inputStream = fileDescriptor.createInputStream()
+        val fileChannel = inputStream.channel
+        return fileChannel.map(FileChannel.MapMode.READ_ONLY, fileDescriptor.startOffset, fileDescriptor.length)
+    }
+
+    fun detect(bitmap: Bitmap): List<DetectionResult> {
+        val interpreter = this.interpreter ?: return emptyList()
+        
+        val inputBuffer = preprocessBitmap(bitmap)
+        val outputArray = Array(1) { Array(NUM_DETECTIONS) { FloatArray(5 + NUM_CLASSES) } }
+        
+        interpreter.run(inputBuffer, outputArray)
+        
+        return parseOutput(outputArray[0], bitmap.width, bitmap.height)
+    }
+
+    private fun preprocessBitmap(bitmap: Bitmap): ByteBuffer {
+        val inputBuffer = ByteBuffer.allocateDirect(1 * INPUT_SIZE * INPUT_SIZE * 3 * 4)
         inputBuffer.order(ByteOrder.nativeOrder())
         
-        val scaledBuffer = ByteBuffer.allocateDirect(inputSize * inputSize * 3 * 4)
-        scaledBuffer.order(ByteOrder.nativeOrder())
+        val scaledBitmap = Bitmap.createScaledBitmap(bitmap, INPUT_SIZE, INPUT_SIZE, true)
+        val pixels = IntArray(INPUT_SIZE * INPUT_SIZE)
+        scaledBitmap.getPixels(pixels, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
         
-        scaleImage(frame, width, height, scaledBuffer, inputSize)
-        
-        scaledBuffer.rewind()
-        while (scaledBuffer.hasRemaining()) {
-            val pixel = scaledBuffer.int
+        for (pixel in pixels) {
             val r = ((pixel shr 16) and 0xFF) / 255f
             val g = ((pixel shr 8) and 0xFF) / 255f
             val b = (pixel and 0xFF) / 255f
@@ -56,58 +82,52 @@ class ObjectDetectionModel @Inject constructor(
         return inputBuffer
     }
 
-    private fun scaleImage(
-        input: ByteBuffer, inputW: Int, inputH: Int,
-        output: ByteBuffer, outputSize: Int
-    ) {
-        val scaleX = outputSize.toFloat() / inputW
-        val scaleY = outputSize.toFloat() / inputH
-        
-        for (y in 0 until outputSize) {
-            for (x in 0 until outputSize) {
-                val srcX = (x / scaleX).toInt().coerceIn(0, inputW - 1)
-                val srcY = (y / scaleY).toInt().coerceIn(0, inputH - 1)
-                
-                val offset = (srcY * inputW + srcX) * 4
-                output.putInt(input.getInt(offset))
-            }
-        }
-    }
-
-    private fun parseOutput(output: Array<FloatArray>): List<DetectionResult> {
+    private fun parseOutput(output: Array<FloatArray>, imgWidth: Int, imgHeight: Int): List<DetectionResult> {
         val results = mutableListOf<DetectionResult>()
         val confidenceThreshold = 0.5f
         
         for (detection in output) {
-            val confidence = detection[4]
-            if (confidence < confidenceThreshold) continue
+            val objConfidence = detection[4]
+            if (objConfidence < confidenceThreshold) continue
             
-            val classId = detection[5].toInt()
+            val classProbs = detection.copyOfRange(5, 5 + NUM_CLASSES)
+            var maxClassProb = Float.MIN_VALUE
+            var classId = 0
+            for (i in classProbs.indices) {
+                if (classProbs[i] > maxClassProb) {
+                    maxClassProb = classProbs[i]
+                    classId = i
+                }
+            }
+            
+            val confidence = objConfidence * maxClassProb
+            if (confidence < confidenceThreshold) continue
             if (classId < 0 || classId >= labels.size) continue
             
-            val x = detection[0]
-            val y = detection[1]
+            val cx = detection[0]
+            val cy = detection[1]
             val w = detection[2]
             val h = detection[3]
             
+            val left = ((cx - w / 2) / INPUT_SIZE * imgWidth).coerceIn(0f, imgWidth.toFloat())
+            val top = ((cy - h / 2) / INPUT_SIZE * imgHeight).coerceIn(0f, imgHeight.toFloat())
+            val right = ((cx + w / 2) / INPUT_SIZE * imgWidth).coerceIn(0f, imgWidth.toFloat())
+            val bottom = ((cy + h / 2) / INPUT_SIZE * imgHeight).coerceIn(0f, imgHeight.toFloat())
+            
             results.add(
                 DetectionResult(
-                    boundingBox = BoundingBox(
-                        left = (x - w / 2) / 640f,
-                        top = (y - h / 2) / 640f,
-                        right = (x + w / 2) / 640f,
-                        bottom = (y + h / 2) / 640f
-                    ),
+                    boundingBox = BoundingBox(left, top, right, bottom),
                     label = labels[classId],
                     confidence = confidence
                 )
             )
         }
         
-        return results
+        return results.sortedByDescending { it.confidence }
     }
 
     fun close() {
         interpreter?.close()
+        interpreter = null
     }
 }

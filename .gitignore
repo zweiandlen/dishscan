@@ -1,20 +1,17 @@
 # Gradle
 .gradle/
-gradle/
 build/
 !gradle/wrapper/gradle-wrapper.jar
 
 # Android Studio / IntelliJ
-*.iml
 .idea/
+*.iml
 local.properties
 
 # Build outputs
 app/build/
 *.apk
 *.aab
-*.ap_
-*.dex
 
 # Generated files
 app/build/generated/
@@ -28,5 +25,9 @@ app/build/outputs/
 .DS_Store
 Thumbs.db
 
-# Local config
-local.properties
+# Keystore
+*.jks
+*.keystore
+
+# NDK
+app/.cxx/
